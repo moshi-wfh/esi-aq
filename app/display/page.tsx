@@ -2,93 +2,132 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { Parameter, Station } from "../../lib/envimtp";
+import { CRITERIA, criteriaOf, LEVELS, levelOf, type Level } from "../../lib/aqi";
 
 type Meta = { fresh: boolean; cache_ttl: number; fetched_at: string };
 type ListItem = { name: string; datetime: string | null; fresh: boolean };
 
 const STALE_MS = 2 * 3600_000; // datetime เก่ากว่า 2 ชม. → "ข้อมูลล่าช้า"
 const PAGE_SIZE = 3; // การ์ดต่อหน้าบนจอ 480×240
-const PAGE_MS = 8000; // สลับหน้าทุก 8 วิ เมื่อพารามิเตอร์เกิน 3 ค่า
+const PAGE_MS = 8000; // ใช้เฉพาะสถานีที่ไม่มี PM10/NO2/SO2 เลย
 
 /* ---------------- format helpers ---------------- */
 const TH_MONTHS = ["ม.ค.", "ก.พ.", "มี.ค.", "เม.ย.", "พ.ค.", "มิ.ย.", "ก.ค.", "ส.ค.", "ก.ย.", "ต.ค.", "พ.ย.", "ธ.ค."];
 
-/** "2026-11-16T11:00:00+07:00" → "16 พ.ย. 69 · 11:00 น." (อ่านจากสตริงตรง ๆ ไม่พึ่ง Intl ของ player) */
+/** "2026-11-16T11:00:00+07:00" → "16 พ.ย. 2569 · 11:00 น." (อ่านจากสตริงตรง ๆ ไม่พึ่ง Intl ของ player) */
 function thaiStamp(iso: string | null): string {
   if (!iso) return "–";
   const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso);
   if (!m) return iso;
-  const be = (Number(m[1]) + 543) % 100;
-  return `${Number(m[3])} ${TH_MONTHS[Number(m[2]) - 1]} ${String(be).padStart(2, "0")} · ${m[4]}:${m[5]} น.`;
+  return `${Number(m[3])} ${TH_MONTHS[Number(m[2]) - 1]} ${Number(m[1]) + 543} · ${m[4]}:${m[5]} น.`;
 }
 
-function thaiClock(iso: string | undefined): string {
-  const m = iso && /T(\d{2}):(\d{2})/.exec(iso);
-  return m ? `${m[1]}:${m[2]}` : "–";
+/** ผสมสี hex กับขาว/ดำ แทน color-mix() ที่ player รุ่นเก่าอาจไม่รองรับ */
+function mix(hex: string, pct: number, withHex: string): string {
+  const p = (h: string) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+  const a = p(hex), b = p(withHex);
+  return "#" + a.map((v, i) => Math.round(v * pct + b[i] * (1 - pct)).toString(16).padStart(2, "0")).join("");
 }
+const tint = (hex: string, pc: number) => mix(hex, pc / 100, "#ffffff");
+const shade = (hex: string) => mix(hex, 0.7, "#000000");
 
 const MET_LABELS: Record<string, string> = {
   TEMP: "อุณหภูมิ", RH: "ความชื้น", BP: "ความกดอากาศ", WS: "ความเร็วลม", WD: "ทิศลม",
   RAIN: "ฝน", SR: "รังสีอาทิตย์", NR: "รังสีสุทธิ",
 };
-const FORMULA = /^(SO|NO|O|CO|CH|NH|H|PM)(\d+(?:\.\d+)?)(S?)$/i;
+const FORMULA = /^(SO|NO|O|CO|CH|NH|H)(\d+)(S?)$/i;
 
 function Label({ name }: { name: string | null }) {
   if (!name) return <>–</>;
   const up = name.toUpperCase();
   if (MET_LABELS[up]) return <>{MET_LABELS[up]}</>;
   if (up === "NOX") return <>NO<sub>x</sub></>;
+  const pm = /^PM(\d+(?:\.\d+)?)$/.exec(up);
+  if (pm) return <>PM<small>{pm[1]}</small></>;
   const m = FORMULA.exec(name);
   if (m) return <>{m[1].toUpperCase()}<sub>{m[2]}</sub>{m[3].toUpperCase()}</>;
   return <>{name}</>;
 }
 
-function prettyUnit(u: string | null): string {
-  if (!u) return "";
+function Unit({ u }: { u: string | null }) {
+  if (!u) return null;
   const k = u.trim().toLowerCase();
-  if (k === "ug/m3") return "µg/m³";
-  if (k === "mg/m3") return "mg/m³";
-  if (k === "degc" || k === "c") return "°C";
-  if (k === "deg") return "°";
-  if (k === "mbar") return "mbar";
-  if (k === "m/s") return "m/s";
-  return u;
+  if (k === "ug/m3" || k === "µg/m³") return <>µg/m<sup>3</sup></>;
+  if (k === "mg/m3") return <>mg/m<sup>3</sup></>;
+  if (k === "degc" || k === "c") return <>°C</>;
+  if (k === "deg") return <>°</>;
+  if (k === "mbar") return <>mbar</>;
+  return <>{u}</>;
 }
 
-type Kind = "ok" | "exceed" | "calib";
-const kindOf = (p: Parameter): Kind =>
-  p.status && p.status.toLowerCase() !== "normal" ? "calib" : p.exceeded ? "exceed" : "ok";
+const isCalib = (p: Parameter) => !!p.status && p.status.toLowerCase() !== "normal";
+
+/* ---------------- face icon (จาก design) ---------------- */
+const MOUTH: Record<number, string> = {
+  1: "M30 60 Q50 82 70 60 Z", 2: "M32 62 Q50 76 68 62", 3: "M34 66 L66 66",
+  4: "M32 70 Q50 58 68 70", 5: "M30 72 Q50 54 70 72 Z",
+};
+function Face({ level, color }: { level: number; color?: string }) {
+  const filled = level === 1 || level === 5;
+  return (
+    <svg className="s-face" viewBox="0 0 100 100" aria-hidden="true">
+      <circle cx="50" cy="50" r="47" fill={color ?? LEVELS[level - 1]?.color ?? "#ccc"} stroke="#fff" strokeWidth="3" />
+      {level <= 2 ? (
+        <path d="M28 42 Q35 34 42 42 M58 42 Q65 34 72 42" stroke="#222" strokeWidth="4" fill="none" strokeLinecap="round" />
+      ) : (
+        <g fill="#222"><circle cx="36" cy="42" r="5" /><circle cx="64" cy="42" r="5" /></g>
+      )}
+      <path d={MOUTH[level]} stroke="#222" strokeWidth="4" strokeLinecap="round" fill={filled ? "#222" : "none"} />
+    </svg>
+  );
+}
 
 /* ---------------- card ---------------- */
+const GREY = "#8b8799";
+
 function Card({ p }: { p: Parameter }) {
-  const kind = kindOf(p);
-  const text = p.value_text ?? "–";
-  const pct = p.limit && p.value !== null ? Math.max(2, Math.min(100, (p.value / p.limit) * 100)) : 0;
+  const c = criteriaOf(p.name);
+  const calib = isCalib(p);
+  const limit = p.limit ?? c?.standard ?? null;
+  const exceed = !calib && p.exceeded;
+  const level: Level | null = c && p.value !== null && !calib ? levelOf(c, p.value) : null;
+  const color = calib ? GREY : exceed ? "#e5484d" : level?.color ?? "#2fc4b2";
+  const text =
+    p.value === null ? p.value_text ?? "–" : c ? p.value.toFixed(c.decimals) : p.value_text ?? String(p.value);
+  const pct = limit && p.value !== null ? Math.max(2, Math.min(100, (p.value / limit) * 100)) : 0;
+  const lvlText = calib ? "สอบเทียบ" : level ? level.label_th : exceed ? "เกินมาตรฐาน" : "ปกติ";
+
   return (
-    <div className={`s-card ${kind === "exceed" ? "exceed" : ""}`}>
+    <div className={`s-card${exceed ? " exceed" : ""}`}>
       <div className="s-top">
         <span className="s-code"><span><Label name={p.name} /></span></span>
-        <i className={`s-dot ${kind}`} />
+        {c && (calib ? <Face level={3} color={GREY} /> : level && <Face level={level.level} />)}
       </div>
-      {kind === "calib" ? (
+      {calib ? (
         <div className="s-val calib">สอบเทียบ</div>
       ) : (
-        <div className={`s-val ${text.length > 6 ? "long" : ""} ${kind === "exceed" ? "exceed" : ""}`}>{text}</div>
+        <div className={`s-val${text.length > 6 ? " long" : ""}${exceed ? " exceed" : ""}`}>{text}</div>
       )}
-      <div className="s-unit">{prettyUnit(p.unit)}</div>
-      <div className="s-bar">{p.limit !== null && <span className={kind === "exceed" ? "exceed" : ""} style={{ width: `${pct}%` }} />}</div>
-      <div className={`s-std ${kind === "exceed" ? "exceed" : ""}`}>
-        {p.limit === null
-          ? "ไม่มีค่ามาตรฐาน"
-          : kind === "exceed"
-            ? `เกินมาตรฐาน (${p.limit})`
-            : `มาตรฐาน ≤ ${p.limit} ${prettyUnit(p.unit)}`}
+      <div className="s-unit"><Unit u={c?.unit ?? p.unit} /></div>
+      <div className="s-bar">{limit !== null && !calib && <span style={{ width: `${pct}%`, background: color }} />}</div>
+      <div className={`s-std${exceed ? " exceed" : ""}`}>
+        {limit === null ? (
+          "ไม่มีค่ามาตรฐาน"
+        ) : exceed ? (
+          `เกินมาตรฐาน (${limit})`
+        ) : (
+          <>มาตรฐาน ≤ {limit} <Unit u={c?.unit ?? p.unit} /></>
+        )}
       </div>
-      <div className={`s-lvl ${kind}`}>
-        {kind === "exceed" ? "เกินมาตรฐาน" : kind === "calib" ? `สถานะ: ${p.status}` : "ปกติ"}
-      </div>
+      <div className="s-lvl" style={{ background: tint(color, 18), color: shade(color) }}>{lvlText}</div>
     </div>
   );
+}
+
+/** PM10, NO2, SO2 ตามลำดับใน design ถ้าสถานีไม่มีเลยให้แสดงทุกพารามิเตอร์แบบสลับหน้า */
+function pickParams(all: Parameter[]): Parameter[] {
+  const picked = CRITERIA.map((c) => all.find((p) => criteriaOf(p.name) === c)).filter(Boolean) as Parameter[];
+  return picked.length ? picked : all;
 }
 
 /* ---------------- station picker (ไม่มี #station ใน URL) ---------------- */
@@ -105,7 +144,8 @@ function Picker() {
     <main className="picker">
       <h1>เลือกสถานี AQMS</h1>
       <p>
-        ตั้ง URL ของจอใน VNNOX เป็น <code>/display#&lt;marker name&gt;</code> · ดูพรีวิวขยาย 2 เท่าด้วย <code>?z=2</code>
+        ตั้ง URL ของจอใน VNNOX เป็น <code>/display#&lt;marker name&gt;</code> · ใส่ชื่อที่จะแสดงบนจอด้วย{" "}
+        <code>?label=สถานีหนองแฟบ</code> · พรีวิวขยาย 2 เท่าด้วย <code>?z=2</code>
       </p>
       {err && <p style={{ color: "var(--red)" }}>โหลดรายชื่อไม่ได้: {err}</p>}
       {!list && !err && <p>กำลังโหลด…</p>}
@@ -130,7 +170,7 @@ type View =
   | { state: "offline" } // ยังไม่เคยได้ข้อมูลเลย และเรียกไม่สำเร็จ
   | { state: "ok"; data: Station; meta: Meta };
 
-function Screen({ station, zoom }: { station: string; zoom: number }) {
+function Screen({ station, label, zoom }: { station: string; label: string | null; zoom: number }) {
   const [view, setView] = useState<View>({ state: "loading" });
   const [stale, setStale] = useState(false);
   const [page, setPage] = useState(0);
@@ -211,8 +251,7 @@ function Screen({ station, zoom }: { station: string; zoom: number }) {
     };
   }, [station]);
 
-  // สลับหน้าการ์ดเมื่อพารามิเตอร์เกิน 3 ค่า
-  const params = view.state === "ok" ? view.data.parameters : [];
+  const params = view.state === "ok" ? pickParams(view.data.parameters) : [];
   const pages = Math.max(1, Math.ceil(params.length / PAGE_SIZE));
   useEffect(() => {
     setPage(0);
@@ -222,12 +261,15 @@ function Screen({ station, zoom }: { station: string; zoom: number }) {
   }, [pages]);
 
   const shown = params.slice(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE);
-  const name = view.state === "ok" ? view.data.name : station;
+  const name = label || (view.state === "ok" ? view.data.name : station);
 
   const scr = (
     <div className="scr" style={zoom !== 1 ? { transform: `scale(${zoom})` } : undefined}>
       <header className="s-hdr">
-        <div className="s-mark">AQ</div>
+        <div className="s-logos">
+          <img className="a" src="/logos/ieat.png" alt="กนอ. การนิคมอุตสาหกรรมแห่งประเทศไทย" />
+          <img className="b" src="/logos/emcc.png" alt="E:mc² Industrial Estate Authority of Thailand" />
+        </div>
         <div className="s-title">
           <b>คุณภาพอากาศ มาบตาพุดคอมเพล็กซ์</b>
           <span>
@@ -252,12 +294,12 @@ function Screen({ station, zoom }: { station: string; zoom: number }) {
         {shown.map((p, i) => <Card key={`${page}-${i}-${p.name}`} p={p} />)}
       </section>
 
-      <footer className="s-foot">
-        <span>ที่มา: envimtp.com</span>
-        <span className="s-pages">
-          {pages > 1 && Array.from({ length: pages }, (_, i) => <i key={i} className={i === page ? "on" : ""} />)}
-        </span>
-        <span>{view.state === "ok" ? `ตรวจล่าสุด ${thaiClock(view.meta.fetched_at)}` : ""}</span>
+      <footer className="s-legend">
+        {LEVELS.map((lv) => (
+          <span key={lv.level} style={{ background: lv.color, color: lv.level === 3 ? "#3b2f00" : "#fff" }}>
+            {lv.label_short_th}
+          </span>
+        ))}
       </footer>
     </div>
   );
@@ -272,6 +314,7 @@ function Screen({ station, zoom }: { station: string; zoom: number }) {
 
 export default function DisplayPage() {
   const [station, setStation] = useState<string | null>(null);
+  const [label, setLabel] = useState<string | null>(null);
   const [zoom, setZoom] = useState(1);
 
   useEffect(() => {
@@ -284,8 +327,10 @@ export default function DisplayPage() {
       }
       setStation(s.trim());
     };
-    const z = Number(new URLSearchParams(location.search).get("z"));
+    const q = new URLSearchParams(location.search);
+    const z = Number(q.get("z"));
     setZoom(z >= 1 && z <= 4 ? z : 1);
+    setLabel(q.get("label")?.trim() || null);
     read();
     addEventListener("hashchange", read);
     return () => removeEventListener("hashchange", read);
@@ -293,5 +338,5 @@ export default function DisplayPage() {
 
   if (station === null) return null;
   if (!station) return <Picker />;
-  return <Screen key={station} station={station} zoom={zoom} />;
+  return <Screen key={station} station={station} label={label} zoom={zoom} />;
 }
